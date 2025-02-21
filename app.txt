@@ -1,0 +1,367 @@
+import os
+from dotenv import load_dotenv
+from typing import Dict, List, Any
+import httpx
+import json
+from datetime import datetime, timedelta
+import chromadb
+from transformers import AutoTokenizer, AutoModel
+import torch
+from tqdm import tqdm
+
+# Load environment variables
+load_dotenv()
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+DUFFEL_API_KEY = os.getenv("DUFFEL_API_KEY")
+
+class CustomEmbedding:
+    def __init__(self):
+        # Using a smaller BERT model for compatibility
+        self.tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
+        self.model = AutoModel.from_pretrained('bert-base-uncased')
+        
+    def mean_pooling(self, model_output, attention_mask):
+        """Perform mean pooling on token embeddings"""
+        token_embeddings = model_output[0]
+        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+        return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+
+    def generate_embedding(self, text: str) -> List[float]:
+        """Generate embeddings using BERT"""
+        # Tokenize and prepare input
+        inputs = self.tokenizer(text, padding=True, truncation=True, return_tensors='pt')
+        
+        # Get model output
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+        
+        # Generate embeddings through mean pooling
+        embeddings = self.mean_pooling(outputs, inputs['attention_mask'])
+        return embeddings[0].tolist()
+
+class NLPPipeline:
+    def __init__(self):
+        # Initialize custom embedding model
+        self.embedding_model = CustomEmbedding()
+        
+        # Initialize ChromaDB client with persistent storage
+        self.chroma_client = chromadb.PersistentClient(path="./chroma_db")
+        
+        # Create or get collections
+        self.text_collection = self.chroma_client.get_or_create_collection(
+            name="text_embeddings",
+            metadata={"description": "Store text embeddings"}
+        )
+        
+        self.api_collection = self.chroma_client.get_or_create_collection(
+            name="api_responses",
+            metadata={"description": "Store API response embeddings"}
+        )
+
+    def store_text_embeddings(self, text: str, metadata: Dict[str, Any] = None) -> str:
+        """Store text and its embeddings in ChromaDB"""
+        embeddings = self.embedding_model.generate_embedding(text)
+        
+        # Generate a unique ID
+        doc_id = f"text_{datetime.now().timestamp()}"
+        
+        self.text_collection.add(
+            embeddings=[embeddings],
+            documents=[text],
+            ids=[doc_id],
+            metadatas=[metadata or {}]
+        )
+        
+        return doc_id
+
+    async def query_llama_groq(self, text: str) -> Dict[str, Any]:
+        """Query the Llama 3 model via Groq API"""
+        # Get today's date and next week's date
+        today = datetime.now()
+        next_week = today + timedelta(days=7)
+        formatted_date = next_week.strftime("%Y-%m-%d")
+
+        headers = {
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        
+        system_prompt = f"""
+        Convert the following text into a JSON object for flight search with these defaults:
+        - Default departure date: {formatted_date}
+        - Default passenger count: 2 adults
+        - Default cabin class: economy
+
+        Return ONLY the following JSON structure with no additional text:
+        {{
+            "slices": [
+                {{
+                    "origin": "AIRPORT_CODE",
+                    "destination": "AIRPORT_CODE",
+                    "departure_date": "{formatted_date}"
+                }}
+            ],
+            "passengers": [
+                {{
+                    "type": "adult",
+                    "count": 2
+                }}
+            ],
+            "cabin_class": "economy"
+        }}
+        """
+        
+        payload = {
+            "model": "llama3-8b-8192",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": system_prompt
+                },
+                {
+                    "role": "user",
+                    "content": text
+                }
+            ],
+            "temperature": 0.3,
+            "max_tokens": 1000
+        }
+        
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers=headers,
+                    json=payload,
+                    timeout=30.0
+                )
+                
+                if response.status_code != 200:
+                    raise Exception(f"Groq API error: {response.text}")
+                
+                response_data = response.json()
+                
+                if not response_data.get('choices') or not response_data['choices'][0].get('message'):
+                    raise Exception("Invalid response format from Groq API")
+                
+                # Extract the content and clean it
+                content = response_data['choices'][0]['message']['content'].strip()
+                
+                # Find the JSON object in the content
+                try:
+                    # Try to find JSON between curly braces
+                    start_idx = content.find('{')
+                    end_idx = content.rfind('}')
+                    
+                    if start_idx != -1 and end_idx != -1:
+                        json_str = content[start_idx:end_idx + 1]
+                        parsed_json = json.loads(json_str)
+                    else:
+                        # If no JSON found, create default JSON
+                        parsed_json = {
+                            "slices": [
+                                {
+                                    "origin": "LHR",  # Default London Heathrow
+                                    "destination": "JFK",  # Default New York JFK
+                                    "departure_date": formatted_date
+                                }
+                            ],
+                            "passengers": [
+                                {
+                                    "type": "adult",
+                                    "count": 2
+                                }
+                            ],
+                            "cabin_class": "economy"
+                        }
+                    
+                    # Validate and ensure defaults
+                    if "passengers" not in parsed_json or not parsed_json["passengers"]:
+                        parsed_json["passengers"] = [{"type": "adult", "count": 2}]
+                    else:
+                        parsed_json["passengers"][0]["count"] = 2
+                    
+                    if "cabin_class" not in parsed_json:
+                        parsed_json["cabin_class"] = "economy"
+                        
+                    if "slices" in parsed_json and parsed_json["slices"]:
+                        parsed_json["slices"][0]["departure_date"] = formatted_date
+                    
+                    return parsed_json
+                    
+                except json.JSONDecodeError as e:
+                    print(f"Failed to parse JSON. Content received: {content}")
+                    # Return default JSON on parse error
+                    return {
+                        "slices": [
+                            {
+                                "origin": "LHR",
+                                "destination": "JFK",
+                                "departure_date": formatted_date
+                            }
+                        ],
+                        "passengers": [
+                            {
+                                "type": "adult",
+                                "count": 2
+                            }
+                        ],
+                        "cabin_class": "economy"
+                    }
+                
+        except httpx.RequestError as e:
+            raise Exception(f"Network error when calling Groq API: {str(e)}")
+        except Exception as e:
+            raise Exception(f"Error in Groq API call: {str(e)}")
+
+    async def query_duffel_api(self, json_payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Query the Duffel API with the formatted JSON"""
+        headers = {
+            "Authorization": f"Bearer {DUFFEL_API_KEY}",
+            "Content-Type": "application/json",
+            "Duffel-Version": "v1",
+            "Accept": "application/json"
+        }
+
+        # Format request payload according to Duffel API requirements
+        duffel_payload = {
+            "data": {
+                "slices": [
+                    {
+                        "origin": json_payload["slices"][0]["origin"],
+                        "destination": json_payload["slices"][0]["destination"],
+                        "departure_date": json_payload["slices"][0]["departure_date"]
+                    }
+                ],
+                "passengers": [{"type": "adult"}] * json_payload["passengers"][0]["count"],
+                "cabin_class": json_payload["cabin_class"]
+            }
+        }
+
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    "https://api.duffel.com/air/offer_requests",
+                    headers=headers,
+                    json=duffel_payload,
+                    timeout=30.0
+                )
+
+                if response.status_code == 404:
+                    print("Duffel API endpoint not found. Checking response:", response.text)
+                    raise Exception("Invalid Duffel API endpoint")
+                
+                if response.status_code != 200:
+                    error_msg = f"Duffel API error (Status {response.status_code}): {response.text}"
+                    print(error_msg)
+                    raise Exception(error_msg)
+
+                response_data = response.json()
+                
+                # If we successfully created the offer request, get the offers
+                if 'data' in response_data and 'id' in response_data['data']:
+                    offer_request_id = response_data['data']['id']
+                    
+                    # Get the actual offers
+                    offers_response = await client.get(
+                        f"https://api.duffel.com/air/offers?offer_request_id={offer_request_id}",
+                        headers=headers
+                    )
+                    
+                    if offers_response.status_code == 200:
+                        return offers_response.json()
+                    else:
+                        raise Exception(f"Failed to get offers: {offers_response.text}")
+                
+                return response_data
+
+        except httpx.RequestError as e:
+            raise Exception(f"Network error when calling Duffel API: {str(e)}")
+        except Exception as e:
+            raise Exception(f"Error in Duffel API call: {str(e)}")
+
+    def store_api_response(self, response: Dict[str, Any], query_text: str) -> str:
+        """Store API response and its embeddings in ChromaDB"""
+        response_str = json.dumps(response)
+        embeddings = self.embedding_model.generate_embedding(response_str)
+        
+        response_id = f"response_{datetime.now().timestamp()}"
+        
+        self.api_collection.add(
+            embeddings=[embeddings],
+            documents=[response_str],
+            ids=[response_id],
+            metadatas=[{"original_query": query_text}]
+        )
+        
+        return response_id
+
+    def query_similar_responses(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
+        """Query for similar responses based on input text"""
+        query_embedding = self.embedding_model.generate_embedding(query)
+        
+        results = self.api_collection.query(
+            query_embeddings=[query_embedding],
+            n_results=k
+        )
+        
+        similar_responses = []
+        for idx, (doc, metadata) in enumerate(zip(results['documents'][0], results['metadatas'][0])):
+            similar_responses.append({
+                "response": json.loads(doc),
+                "metadata": metadata,
+                "similarity_score": results['distances'][0][idx]
+            })
+        
+        return similar_responses
+
+async def main():
+    try:
+        # Initialize the pipeline
+        pipeline = NLPPipeline()
+        
+        # Example usage
+        user_query = "find me flights between new delhi to mumbai next week"
+        
+        print("Processing query:", user_query)
+        
+        # Store the original query embeddings
+        query_id = pipeline.store_text_embeddings(
+            user_query,
+            metadata={"type": "flight_search", "timestamp": datetime.now().isoformat()}
+        )
+        print(f"Stored query with ID: {query_id}")
+        
+        # Generate JSON format using Llama 3 via Groq
+        print("Querying Llama 3 via Groq...")
+        try:
+            formatted_json = await pipeline.query_llama_groq(user_query)
+            print("Formatted JSON:", json.dumps(formatted_json, indent=2))
+        except Exception as e:
+            print(f"Error getting formatted JSON from Groq: {str(e)}")
+            return None
+        
+        # Query Duffel API
+        print("Querying Duffel API...")
+        duffel_response = await pipeline.query_duffel_api(formatted_json)
+        
+        # Store the API response
+        response_id = pipeline.store_api_response(duffel_response, user_query)
+        print(f"Stored API response with ID: {response_id}")
+        
+        # Query for similar responses
+        print("Finding similar previous queries...")
+        similar_results = pipeline.query_similar_responses(user_query)
+        
+        return similar_results
+        
+    except Exception as e:
+        print(f"Error occurred: {str(e)}")
+        raise
+
+
+if __name__ == "__main__":
+    import asyncio
+    results = asyncio.run(main())
+    print("\nSimilar results found:")
+    print(json.dumps(results, indent=2))

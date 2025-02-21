@@ -1,0 +1,1 @@
+pip install transformers torch qdrant-client python-dotenv httpx scikit-learn pandas
