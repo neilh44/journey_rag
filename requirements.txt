@@ -1,1 +1,6 @@
-pip install transformers torch qdrant-client python-dotenv httpx scikit-learn pandas
+transformers
+torch
+chromadb
+python-dotenv
+httpx
+tqdm
